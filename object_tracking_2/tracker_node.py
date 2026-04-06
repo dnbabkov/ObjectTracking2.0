@@ -669,7 +669,7 @@ def parse_args(args=None):
     parser.add_argument(
         '--segmentator',
         required=True,
-        choices=['CLIP', 'DinoSAM'],
+        choices=['CLIP', 'DinoSAM', 'SEEM', 'OpenSeeD'],
         help='Имя используемого сегментатора',
     )
     return parser.parse_args(args)

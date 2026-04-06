@@ -23,7 +23,7 @@ setup(
         ),
         (
             os.path.join('share', package_name, 'model_weights'),
-            glob('model_weights/*'),
+            glob('./object_tracking_2/model_weights/*'),
         ),
     ],
     install_requires=[

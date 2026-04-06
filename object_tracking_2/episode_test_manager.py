@@ -46,6 +46,7 @@ class EpisodeTestManager(Node):
         ]
         self.EPISODES_PER_PROMPT = 20
 
+
         # ------------------------------------------------------------------
         # PARAMETERS
         # ------------------------------------------------------------------
@@ -57,8 +58,8 @@ class EpisodeTestManager(Node):
         self.declare_parameter('episode_start_image_topic', '/episode_start_image')
         self.declare_parameter('navigate_action_name', 'navigate_to_pose')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
-        self.declare_parameter('return_timeout_sec', 120.0)
-        self.declare_parameter('episode_timeout_sec', 60.0)
+        self.declare_parameter('return_timeout_sec', 250.0)
+        self.declare_parameter('episode_timeout_sec', 90.0)
         self.declare_parameter('restart_delay_sec', 1.0)
         self.declare_parameter('home_align_angular_speed', 0.15)
         self.declare_parameter('home_yaw_tolerance_deg', 1.5)
