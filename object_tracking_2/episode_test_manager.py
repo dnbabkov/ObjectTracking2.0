@@ -46,7 +46,6 @@ class EpisodeTestManager(Node):
         ]
         self.EPISODES_PER_PROMPT = 20
 
-
         # ------------------------------------------------------------------
         # PARAMETERS
         # ------------------------------------------------------------------
@@ -64,6 +63,7 @@ class EpisodeTestManager(Node):
         self.declare_parameter('home_align_angular_speed', 0.15)
         self.declare_parameter('home_yaw_tolerance_deg', 1.5)
         self.declare_parameter('home_align_timeout_sec', 20.0)
+        self.declare_parameter('episode_finish_artifact_grace_sec', 0.5)
 
         self.map_frame = self.get_parameter('map_frame').get_parameter_value().string_value
         self.robot_frame = self.get_parameter('robot_frame').get_parameter_value().string_value
@@ -78,6 +78,11 @@ class EpisodeTestManager(Node):
         self.home_align_angular_speed = self.get_parameter('home_align_angular_speed').get_parameter_value().double_value
         self.home_yaw_tolerance_deg = self.get_parameter('home_yaw_tolerance_deg').get_parameter_value().double_value
         self.home_align_timeout_sec = self.get_parameter('home_align_timeout_sec').get_parameter_value().double_value
+        self.episode_finish_artifact_grace_sec = (
+            self.get_parameter('episode_finish_artifact_grace_sec')
+            .get_parameter_value()
+            .double_value
+        )
 
         self.home_yaw_tolerance = math.radians(self.home_yaw_tolerance_deg)
 
@@ -116,6 +121,11 @@ class EpisodeTestManager(Node):
             'save_start_pose',
             self.save_start_pose_callback,
         )
+        self.clear_start_poses_srv = self.create_service(
+            Trigger,
+            'clear_start_poses',
+            self.clear_start_poses_callback,
+        )
         self.start_test_srv = self.create_service(
             Trigger,
             'start_test_mode',
@@ -143,7 +153,9 @@ class EpisodeTestManager(Node):
         # ------------------------------------------------------------------
         # TEST STATE
         # ------------------------------------------------------------------
-        self.saved_start_pose = None
+        self.saved_start_poses = []
+        self.current_start_pose_index = 0
+        self.need_move_to_start_pose_before_next_episode = False
 
         self.phase = TestPhase.IDLE
         self.test_active = False
@@ -164,6 +176,11 @@ class EpisodeTestManager(Node):
         self.current_episode_start_time = None
         self.current_episode_target_coords = None
         self.current_episode_image_saved = False
+        self.current_episode_last_image_msg = None
+
+        # Отложенное завершение эпизода, чтобы успели приехать артефакты
+        self.finish_episode_timer = None
+        self.pending_finish_result = None
 
         # Артефакты теста
         self.results_root = Path('test_results')
@@ -241,8 +258,33 @@ class EpisodeTestManager(Node):
         pose = self._lookup_current_robot_pose()
         return self.quaternion_to_yaw(pose.pose.orientation)
 
+    def _has_saved_start_poses(self) -> bool:
+        return len(self.saved_start_poses) > 0
+
+    def _get_current_start_pose(self) -> PoseStamped:
+        if not self._has_saved_start_poses():
+            raise RuntimeError('No saved start poses')
+
+        if self.current_start_pose_index < 0 or self.current_start_pose_index >= len(self.saved_start_poses):
+            raise RuntimeError(
+                f'Current start pose index {self.current_start_pose_index} is out of range'
+            )
+
+        return self.saved_start_poses[self.current_start_pose_index]
+
+    def _get_current_start_pose_number(self) -> int:
+        return self.current_start_pose_index + 1
+
     def _get_saved_start_yaw(self) -> float:
-        return self.quaternion_to_yaw(self.saved_start_pose.pose.orientation)
+        start_pose = self._get_current_start_pose()
+        return self.quaternion_to_yaw(start_pose.pose.orientation)
+
+    def _episode_artifact_window_open(self) -> bool:
+        return (
+            self.test_active
+            and self.current_prompt != ''
+            and self.current_episode_start_time is not None
+        )
 
     # ----------------------------------------------------------------------
     # OUTPUT FILES
@@ -270,6 +312,11 @@ class EpisodeTestManager(Node):
         with self.current_results_file.open('w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f, delimiter=';')
             writer.writerow([
+                'start_pose_number',
+                'start_pose_x',
+                'start_pose_y',
+                'start_pose_z',
+                'start_pose_yaw_deg',
                 'prompt',
                 'episode_number_for_prompt',
                 'result',
@@ -303,9 +350,30 @@ class EpisodeTestManager(Node):
             ).nanoseconds / 1e9
             time_to_target_sec = f'{elapsed:.3f}'
 
+        try:
+            start_pose = self._get_current_start_pose()
+            start_pose_number = self._get_current_start_pose_number()
+            start_x = start_pose.pose.position.x
+            start_y = start_pose.pose.position.y
+            start_z = start_pose.pose.position.z
+            start_yaw_deg = math.degrees(
+                self.quaternion_to_yaw(start_pose.pose.orientation)
+            )
+        except Exception:
+            start_pose_number = ''
+            start_x = ''
+            start_y = ''
+            start_z = ''
+            start_yaw_deg = ''
+
         with self.current_results_file.open('a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f, delimiter=';')
             writer.writerow([
+                start_pose_number,
+                start_x,
+                start_y,
+                start_z,
+                start_yaw_deg,
                 self.current_prompt,
                 self.current_episode_number_for_prompt,
                 result,
@@ -315,17 +383,69 @@ class EpisodeTestManager(Node):
                 time_to_target_sec,
             ])
 
+    def _get_current_episode_image_filepath(self):
+        if self.current_images_dir is None:
+            return None
+
+        filename = (
+            f'startpose_{self._get_current_start_pose_number()}_'
+            f'{self.sanitize_prompt_for_filename(self.current_prompt)}'
+            f'_{self.current_episode_number_for_prompt}.png'
+        )
+        return self.current_images_dir / filename
+
+    def _try_save_current_episode_image_from_cache(self) -> bool:
+        if self.current_episode_image_saved:
+            return True
+
+        if self.current_episode_last_image_msg is None:
+            return False
+
+        filepath = self._get_current_episode_image_filepath()
+        if filepath is None:
+            return False
+
+        try:
+            image = self.bridge.imgmsg_to_cv2(
+                self.current_episode_last_image_msg,
+                desired_encoding='bgr8',
+            )
+        except CvBridgeError as e:
+            self.get_logger().warn(f'Failed to decode cached episode image: {e}')
+            return False
+
+        try:
+            import cv2
+            cv2.imwrite(str(filepath), image)
+            self.current_episode_image_saved = True
+            self.get_logger().info(f'Saved start segmented image: {filepath}')
+            return True
+        except Exception as e:
+            self.get_logger().warn(f'Failed to save cached segmented image: {e}')
+            return False
+
     # ----------------------------------------------------------------------
     # SERVICES
     # ----------------------------------------------------------------------
     def save_start_pose_callback(self, request, response):
+        if self.test_active:
+            response.success = False
+            response.message = 'Cannot save start pose while test mode is active'
+            return response
+
         try:
-            self.saved_start_pose = self._lookup_current_robot_pose()
+            pose = self._lookup_current_robot_pose()
+            self.saved_start_poses.append(pose)
+
+            pose_number = len(self.saved_start_poses)
+            yaw_deg = math.degrees(self.quaternion_to_yaw(pose.pose.orientation))
+
             response.success = True
             response.message = (
-                f'Start pose saved: '
-                f'x={self.saved_start_pose.pose.position.x:.3f}, '
-                f'y={self.saved_start_pose.pose.position.y:.3f}'
+                f'Start pose #{pose_number} saved: '
+                f'x={pose.pose.position.x:.3f}, '
+                f'y={pose.pose.position.y:.3f}, '
+                f'yaw_deg={yaw_deg:.2f}'
             )
             self.get_logger().info(response.message)
         except Exception as e:
@@ -335,10 +455,25 @@ class EpisodeTestManager(Node):
 
         return response
 
-    def start_test_mode_callback(self, request, response):
-        if self.saved_start_pose is None:
+    def clear_start_poses_callback(self, request, response):
+        if self.test_active:
             response.success = False
-            response.message = 'Start pose is not saved'
+            response.message = 'Cannot clear start poses while test mode is active'
+            return response
+
+        count = len(self.saved_start_poses)
+        self.saved_start_poses.clear()
+        self.current_start_pose_index = 0
+
+        response.success = True
+        response.message = f'Cleared {count} saved start pose(s)'
+        self.get_logger().info(response.message)
+        return response
+
+    def start_test_mode_callback(self, request, response):
+        if not self._has_saved_start_poses():
+            response.success = False
+            response.message = 'No saved start poses'
             return response
 
         if self.test_active:
@@ -353,6 +488,7 @@ class EpisodeTestManager(Node):
 
         self._prepare_output_artifacts()
 
+        self.current_start_pose_index = 0
         self.prompt_index = 0
         self.completed_episodes_for_current_prompt = 0
         self.current_prompt = ''
@@ -361,9 +497,11 @@ class EpisodeTestManager(Node):
         self.test_active = True
         self.phase = TestPhase.IDLE
         self.last_target_reached = False
+        self.need_move_to_start_pose_before_next_episode = True
 
         self.get_logger().info(
-            f'Starting test mode: {len(self.TEST_PROMPTS)} prompts, '
+            f'Starting test mode: {len(self.saved_start_poses)} start pose(s), '
+            f'{len(self.TEST_PROMPTS)} prompts, '
             f'{self.EPISODES_PER_PROMPT} episodes per prompt'
         )
 
@@ -385,7 +523,7 @@ class EpisodeTestManager(Node):
             return response
 
         self.get_logger().warn('Current episode canceled by service call')
-        self._finish_episode_and_return_home('canceled')
+        self._request_finish_episode_and_return_home('canceled')
 
         response.success = True
         response.message = 'Current episode canceled'
@@ -422,10 +560,10 @@ class EpisodeTestManager(Node):
             return
 
         self.get_logger().info('Received target reached signal')
-        self._finish_episode_and_return_home('success')
+        self._request_finish_episode_and_return_home('success')
 
     def episode_start_info_callback(self, msg: String):
-        if not self.test_active or self.phase != TestPhase.RUNNING_EPISODE:
+        if not self._episode_artifact_window_open():
             return
 
         try:
@@ -452,52 +590,103 @@ class EpisodeTestManager(Node):
         )
 
     def episode_start_image_callback(self, msg: Image):
-        if not self.test_active or self.phase != TestPhase.RUNNING_EPISODE:
+        if not self._episode_artifact_window_open():
             return
 
         if self.current_images_dir is None:
             return
 
+        self.current_episode_last_image_msg = msg
+
         if self.current_episode_image_saved:
             return
 
-        try:
-            image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except CvBridgeError as e:
-            self.get_logger().warn(f'Failed to decode episode start image: {e}')
-            return
-
-        filename = (
-            f'{self.sanitize_prompt_for_filename(self.current_prompt)}'
-            f'_{self.current_episode_number_for_prompt}.png'
-        )
-        filepath = self.current_images_dir / filename
-
-        try:
-            import cv2
-            cv2.imwrite(str(filepath), image)
-            self.current_episode_image_saved = True
-            self.get_logger().info(f'Saved start segmented image: {filepath}')
-        except Exception as e:
-            self.get_logger().warn(f'Failed to save segmented image: {e}')
+        self._try_save_current_episode_image_from_cache()
 
     # ----------------------------------------------------------------------
     # EPISODE FLOW
     # ----------------------------------------------------------------------
+    def _request_finish_episode_and_return_home(self, result: str):
+        if not self.test_active:
+            return
+
+        if self.phase != TestPhase.RUNNING_EPISODE:
+            return
+
+        if self.finish_episode_timer is not None:
+            return
+
+        self.pending_finish_result = result
+        self.episode_deadline = None
+
+        # Возможно картинка уже пришла
+        self._try_save_current_episode_image_from_cache()
+
+        def timer_cb():
+            if self.finish_episode_timer is not None:
+                self.finish_episode_timer.cancel()
+                self.destroy_timer(self.finish_episode_timer)
+                self.finish_episode_timer = None
+
+            pending_result = self.pending_finish_result
+            self.pending_finish_result = None
+
+            if pending_result is not None:
+                self._finish_episode_and_return_home(pending_result)
+
+        self.finish_episode_timer = self.create_timer(
+            self.episode_finish_artifact_grace_sec,
+            timer_cb,
+        )
+
     def _start_next_episode(self):
         if not self.test_active:
             return
 
-        while (
-            self.prompt_index < len(self.TEST_PROMPTS)
-            and self.completed_episodes_for_current_prompt >= self.EPISODES_PER_PROMPT
-        ):
-            self.prompt_index += 1
-            self.completed_episodes_for_current_prompt = 0
+        switched_start_pose = False
 
-        if self.prompt_index >= len(self.TEST_PROMPTS):
-            self.get_logger().info('All prompts completed')
-            self._finish_test_mode()
+        while True:
+            if self.current_start_pose_index >= len(self.saved_start_poses):
+                self.get_logger().info('All start poses and prompts completed')
+                self._finish_test_mode()
+                return
+
+            if self.prompt_index >= len(self.TEST_PROMPTS):
+                self.current_start_pose_index += 1
+                self.prompt_index = 0
+                self.completed_episodes_for_current_prompt = 0
+                switched_start_pose = True
+
+                if self.current_start_pose_index < len(self.saved_start_poses):
+                    pose = self._get_current_start_pose()
+                    self.get_logger().info(
+                        f'Switching to start pose '
+                        f'{self._get_current_start_pose_number()}/{len(self.saved_start_poses)}: '
+                        f'x={pose.pose.position.x:.3f}, '
+                        f'y={pose.pose.position.y:.3f}'
+                    )
+                continue
+
+            if self.completed_episodes_for_current_prompt >= self.EPISODES_PER_PROMPT:
+                self.prompt_index += 1
+                self.completed_episodes_for_current_prompt = 0
+                continue
+
+            break
+
+        if switched_start_pose:
+            self.need_move_to_start_pose_before_next_episode = True
+
+        if self.need_move_to_start_pose_before_next_episode:
+            start_pose = self._get_current_start_pose()
+            self.get_logger().info(
+                f'Moving to start pose {self._get_current_start_pose_number()}/{len(self.saved_start_poses)} '
+                f'before starting episode: '
+                f'x={start_pose.pose.position.x:.3f}, '
+                f'y={start_pose.pose.position.y:.3f}'
+            )
+            self.phase = TestPhase.RETURNING_HOME
+            self._send_return_home_goal()
             return
 
         self.current_prompt = self.TEST_PROMPTS[self.prompt_index]
@@ -509,13 +698,25 @@ class EpisodeTestManager(Node):
         )
         self.current_episode_target_coords = None
         self.current_episode_image_saved = False
+        self.current_episode_last_image_msg = None
+        self.pending_finish_result = None
         self.last_target_reached = False
+
+        if self.finish_episode_timer is not None:
+            self.finish_episode_timer.cancel()
+            self.destroy_timer(self.finish_episode_timer)
+            self.finish_episode_timer = None
+
         self.phase = TestPhase.RUNNING_EPISODE
 
+        start_pose = self._get_current_start_pose()
         self.get_logger().info(
-            f'Starting prompt {self.prompt_index + 1}/{len(self.TEST_PROMPTS)}: '
+            f'Starting start pose {self._get_current_start_pose_number()}/{len(self.saved_start_poses)}, '
+            f'prompt {self.prompt_index + 1}/{len(self.TEST_PROMPTS)}: '
             f'"{self.current_prompt}", '
-            f'episode {self.current_episode_number_for_prompt}/{self.EPISODES_PER_PROMPT}'
+            f'episode {self.current_episode_number_for_prompt}/{self.EPISODES_PER_PROMPT}, '
+            f'home x={start_pose.pose.position.x:.3f}, '
+            f'home y={start_pose.pose.position.y:.3f}'
         )
 
         self._publish_prompt(self.current_prompt)
@@ -527,16 +728,24 @@ class EpisodeTestManager(Node):
         if self.phase != TestPhase.RUNNING_EPISODE:
             return
 
+        if self.finish_episode_timer is not None:
+            self.finish_episode_timer.cancel()
+            self.destroy_timer(self.finish_episode_timer)
+            self.finish_episode_timer = None
+
+        self.pending_finish_result = None
+
+        self._try_save_current_episode_image_from_cache()
         self._append_result_row(result)
 
         self.get_logger().info(
-            f'Finished prompt "{self.current_prompt}", '
+            f'Finished start pose {self._get_current_start_pose_number()}/{len(self.saved_start_poses)}, '
+            f'prompt "{self.current_prompt}", '
             f'episode {self.current_episode_number_for_prompt}/{self.EPISODES_PER_PROMPT}, '
             f'result={result}'
         )
 
         self.completed_episodes_for_current_prompt += 1
-
         self.episode_deadline = None
 
         self._clear_prompt()
@@ -547,9 +756,11 @@ class EpisodeTestManager(Node):
     # RETURN HOME
     # ----------------------------------------------------------------------
     def _send_return_home_goal(self):
-        if self.saved_start_pose is None:
-            self.get_logger().error('No saved start pose')
-            self._abort_test_mode('No saved start pose')
+        try:
+            start_pose = self._get_current_start_pose()
+        except Exception as e:
+            self.get_logger().error(f'No saved start pose: {e}')
+            self._abort_test_mode(f'No saved start pose: {e}')
             return
 
         if not self.nav2_client.wait_for_server(timeout_sec=1.0):
@@ -558,15 +769,15 @@ class EpisodeTestManager(Node):
             return
 
         goal_pose = PoseStamped()
-        goal_pose.header.frame_id = self.saved_start_pose.header.frame_id
+        goal_pose.header.frame_id = start_pose.header.frame_id
         goal_pose.header.stamp = self.get_clock().now().to_msg()
-        goal_pose.pose = self.saved_start_pose.pose
+        goal_pose.pose = start_pose.pose
 
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = goal_pose
 
         self.get_logger().info(
-            f'Returning to saved pose: '
+            f'Returning to saved pose #{self._get_current_start_pose_number()}: '
             f'x={goal_pose.pose.position.x:.3f}, '
             f'y={goal_pose.pose.position.y:.3f}'
         )
@@ -611,10 +822,6 @@ class EpisodeTestManager(Node):
         self._abort_test_mode(f'Return-home goal failed with status {status}')
 
     def _align_home_orientation_step(self):
-        if self.saved_start_pose is None:
-            self._abort_test_mode('No saved start pose for alignment')
-            return
-
         try:
             current_yaw = self._get_robot_yaw_in_map()
             target_yaw = self._get_saved_start_yaw()
@@ -630,7 +837,12 @@ class EpisodeTestManager(Node):
             self.phase = TestPhase.IDLE
             self.align_deadline = None
             self.get_logger().info('Home orientation aligned')
-            self._schedule_next_episode()
+
+            if self.need_move_to_start_pose_before_next_episode:
+                self.need_move_to_start_pose_before_next_episode = False
+                self._start_next_episode()
+            else:
+                self._schedule_next_episode()
             return
 
         cmd = Twist()
@@ -659,9 +871,15 @@ class EpisodeTestManager(Node):
         self._clear_prompt()
         self._publish_stop()
 
+        if self.finish_episode_timer is not None:
+            self.finish_episode_timer.cancel()
+            self.destroy_timer(self.finish_episode_timer)
+            self.finish_episode_timer = None
+
         self.phase = TestPhase.IDLE
         self.test_active = False
 
+        self.current_start_pose_index = 0
         self.prompt_index = 0
         self.completed_episodes_for_current_prompt = 0
         self.current_prompt = ''
@@ -670,10 +888,13 @@ class EpisodeTestManager(Node):
         self.current_episode_start_time = None
         self.current_episode_target_coords = None
         self.current_episode_image_saved = False
+        self.current_episode_last_image_msg = None
+        self.pending_finish_result = None
 
         self.last_target_reached = False
         self.return_deadline = None
         self.align_deadline = None
+        self.need_move_to_start_pose_before_next_episode = False
 
         if self.restart_timer is not None:
             self.restart_timer.cancel()
@@ -694,6 +915,11 @@ class EpisodeTestManager(Node):
             self.return_goal_handle.cancel_goal_async()
             self.return_goal_handle = None
 
+        if self.finish_episode_timer is not None:
+            self.finish_episode_timer.cancel()
+            self.destroy_timer(self.finish_episode_timer)
+            self.finish_episode_timer = None
+
         if self.restart_timer is not None:
             self.restart_timer.cancel()
             self.destroy_timer(self.restart_timer)
@@ -702,6 +928,7 @@ class EpisodeTestManager(Node):
         self.phase = TestPhase.IDLE
         self.test_active = False
 
+        self.current_start_pose_index = 0
         self.prompt_index = 0
         self.completed_episodes_for_current_prompt = 0
         self.current_prompt = ''
@@ -710,10 +937,13 @@ class EpisodeTestManager(Node):
         self.current_episode_start_time = None
         self.current_episode_target_coords = None
         self.current_episode_image_saved = False
+        self.current_episode_last_image_msg = None
+        self.pending_finish_result = None
 
         self.return_deadline = None
         self.align_deadline = None
         self.last_target_reached = False
+        self.need_move_to_start_pose_before_next_episode = False
 
         self.get_logger().warn(f'Test mode aborted: {reason}')
 
@@ -723,24 +953,24 @@ class EpisodeTestManager(Node):
         if self.phase == TestPhase.RUNNING_EPISODE:
             if self.episode_deadline is not None and self.get_clock().now() > self.episode_deadline:
                 self.get_logger().error('Episode timeout expired')
-                self._finish_episode_and_return_home('fail')
+                self._request_finish_episode_and_return_home('fail')
             return
-    
+
         if self.phase == TestPhase.RETURNING_HOME:
             if self.return_deadline is None:
                 return
-    
+
             if self.get_clock().now() > self.return_deadline:
                 self.get_logger().error('Return-home timeout expired')
                 self._abort_test_mode('Return-home timeout expired')
             return
-    
+
         if self.phase == TestPhase.ALIGNING_HOME:
             if self.align_deadline is not None and self.get_clock().now() > self.align_deadline:
                 self.get_logger().error('Home alignment timeout expired')
                 self._abort_test_mode('Home alignment timeout expired')
                 return
-    
+
             self._align_home_orientation_step()
 
 
