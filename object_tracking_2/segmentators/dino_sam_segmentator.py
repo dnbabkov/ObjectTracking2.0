@@ -238,7 +238,16 @@ class DinoSAMSegmentator(BaseSegmentator):
         if len(x_indices) == 0 or len(y_indices) == 0:
             return None
 
-        x_mean = int(np.mean(x_indices))
-        y_mean = int(np.mean(y_indices))
+        x_median = float(np.median(x_indices))
+        y_median = float(np.median(y_indices))
 
-        return x_mean, y_mean
+        points = np.column_stack((x_indices, y_indices)).astype(np.float32)
+        target = np.array([x_median, y_median], dtype=np.float32)
+
+        distances_sq = np.sum((points - target) ** 2, axis=1)
+        best_idx = int(np.argmin(distances_sq))
+
+        x_center = int(points[best_idx, 0])
+        y_center = int(points[best_idx, 1])
+
+        return x_center, y_center

@@ -39,6 +39,7 @@ setup(
         'console_scripts': [
             'tracker_node = object_tracking_2.tracker_node:main',
             'episode_test_manager = object_tracking_2.episode_test_manager:main',
+            'tracker_node_dynamic = object_tracking_2.tracker_node_dynamic:main',
         ],
     },
 )
