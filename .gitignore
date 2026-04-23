@@ -1,1 +1,24 @@
+# Model weights
 object_tracking_2/model_weights/*
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
